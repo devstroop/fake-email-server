@@ -8,7 +8,8 @@
 //!
 //! ```text
 //! :1025 (SMTP_PORT)   mail intake
-//! :8080 (PORT)        GET /api/messages · GET /healthz · GET / (web UI)
+//! :8080 (PORT)        GET /api/messages · GET /healthz · GET / (htmx web UI)
+//!                     GET /rows · GET /stats · POST /clear (UI partials)
 //! ```
 
 use std::{
@@ -16,7 +17,12 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use axum::{Json, Router, extract::State, response::Html, routing::get};
+use axum::{
+    Json, Router,
+    extract::State,
+    response::Html,
+    routing::{get, post},
+};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use tokio::{
@@ -105,15 +111,15 @@ async fn handle_smtp(stream: TcpStream, state: AppState) {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
 
-    async fn reply(
-        writer: &mut tokio::net::tcp::OwnedWriteHalf,
-        s: &str,
-    ) -> std::io::Result<()> {
+    async fn reply(writer: &mut tokio::net::tcp::OwnedWriteHalf, s: &str) -> std::io::Result<()> {
         writer.write_all(format!("{s}\r\n").as_bytes()).await?;
         writer.flush().await
     }
 
-    if reply(&mut writer, "220 fake-email-server ESMTP").await.is_err() {
+    if reply(&mut writer, "220 fake-email-server ESMTP")
+        .await
+        .is_err()
+    {
         return;
     }
     let mut from = String::new();
@@ -142,7 +148,10 @@ async fn handle_smtp(stream: TcpStream, state: AppState) {
                 return;
             }
         } else if upper == "DATA" {
-            if reply(&mut writer, "354 End with . on its own line").await.is_err() {
+            if reply(&mut writer, "354 End with . on its own line")
+                .await
+                .is_err()
+            {
                 return;
             }
             let mut data = String::new();
@@ -159,7 +168,12 @@ async fn handle_smtp(stream: TcpStream, state: AppState) {
                     _ => return,
                 }
             }
-            store(&state, std::mem::take(&mut from), std::mem::take(&mut to), &data);
+            store(
+                &state,
+                std::mem::take(&mut from),
+                std::mem::take(&mut to),
+                &data,
+            );
             if reply(&mut writer, "250 OK queued").await.is_err() {
                 return;
             }
@@ -176,7 +190,10 @@ async fn handle_smtp(stream: TcpStream, state: AppState) {
         } else if upper == "QUIT" {
             let _ = reply(&mut writer, "221 Bye").await;
             return;
-        } else if reply(&mut writer, "502 Command not implemented").await.is_err() {
+        } else if reply(&mut writer, "502 Command not implemented")
+            .await
+            .is_err()
+        {
             return;
         }
     }
@@ -185,16 +202,17 @@ async fn handle_smtp(stream: TcpStream, state: AppState) {
 /// `<addr>` brackets stripped, surrounding whitespace trimmed.
 fn addr(line: &str) -> String {
     line.split_once(':')
-        .map(|(_, v)| v.trim().trim_matches(|c| c == '<' || c == '>').trim().to_string())
+        .map(|(_, v)| {
+            v.trim()
+                .trim_matches(|c| c == '<' || c == '>')
+                .trim()
+                .to_string()
+        })
         .unwrap_or_default()
 }
 
 async fn messages(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let mut items = state
-        .inbox
-        .read()
-        .map(|g| g.clone())
-        .unwrap_or_default();
+    let mut items = state.inbox.read().map(|g| g.clone()).unwrap_or_default();
     items.sort_by_key(|m| std::cmp::Reverse(m.received_at));
     Json(serde_json::json!({ "data": items, "total": items.len() }))
 }
@@ -203,56 +221,148 @@ async fn healthz() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "ok": true }))
 }
 
-const INDEX_HTML: &str = r#"<!doctype html>
+/// HTML-escape user-controlled text (message content lands in the UI).
+fn esc(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RowsQuery {
+    #[serde(default)]
+    q: Option<String>,
+}
+
+/// Newest-first inbox with an optional substring filter over
+/// to/subject/from/body (case-insensitive).
+fn filtered(state: &AppState, q: &RowsQuery) -> Vec<Email> {
+    let mut items = state.inbox.read().map(|g| g.clone()).unwrap_or_default();
+    items.sort_by_key(|m| std::cmp::Reverse(m.received_at));
+    let needle = q.q.as_deref().map(str::to_lowercase).unwrap_or_default();
+    items
+        .into_iter()
+        .filter(|m| {
+            needle.is_empty()
+                || m.to.iter().any(|t| t.to_lowercase().contains(&needle))
+                || m.subject.to_lowercase().contains(&needle)
+                || m.from.to_lowercase().contains(&needle)
+                || m.body.to_lowercase().contains(&needle)
+        })
+        .collect()
+}
+
+fn short_subject(subject: &str) -> String {
+    if subject.is_empty() {
+        "(no subject)".to_string()
+    } else {
+        subject.to_string()
+    }
+}
+
+fn rows_html(items: &[Email]) -> String {
+    if items.is_empty() {
+        return "<tr><td colspan=\"3\" class=\"empty\">No mail yet — point an SMTP client at :1025 and it lands here.</td></tr>"
+            .to_string();
+    }
+    let mut out = String::new();
+    for m in items {
+        out.push_str(&format!(
+            "<tr><td>{}</td><td>{}</td><td class=\"at\">{}</td></tr><tr class=\"detail\"><td colspan=\"3\"><details><summary>from: {}</summary><div class=\"full\">{}</div><div class=\"meta\">id: {}</div></details></td></tr>",
+            esc(&m.to.join(", ")),
+            esc(&short_subject(&m.subject)),
+            m.received_at.format("%d %b %H:%M:%S"),
+            esc(&m.from),
+            esc(&m.body),
+            m.id,
+        ));
+    }
+    out
+}
+
+fn stats_html(state: &AppState) -> String {
+    let n = state.inbox.read().map(|g| g.len()).unwrap_or(0);
+    format!("<strong>{n}</strong> messages")
+}
+
+async fn rows(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<RowsQuery>,
+) -> Html<String> {
+    Html(rows_html(&filtered(&state, &q)))
+}
+
+async fn stats(State(state): State<AppState>) -> Html<String> {
+    Html(stats_html(&state))
+}
+
+async fn clear(State(state): State<AppState>) -> Html<String> {
+    state
+        .inbox
+        .write()
+        .map(|mut g| g.clear())
+        .unwrap_or_else(|_| tracing::error!("inbox poisoned"));
+    tracing::info!("inbox cleared from web UI");
+    Html(rows_html(&[]))
+}
+
+async fn htmx_js() -> (
+    [(axum::http::header::HeaderName, &'static str); 1],
+    &'static str,
+) {
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/javascript")],
+        include_str!("../htmx.min.js"),
+    )
+}
+
+const INDEX_HTML: &str = r##"<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>fake-email-server inbox</title>
+<script src="/htmx.min.js"></script>
 <style>
-body { font-family: system-ui, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; }
+:root { color-scheme: light dark; }
+body { font-family: system-ui, sans-serif; max-width: 860px; margin: 2rem auto; padding: 0 1rem; }
+header { display: flex; align-items: baseline; gap: 1rem; flex-wrap: wrap; }
+header h1 { margin: 0; font-size: 1.4rem; }
+#stats { color: #666; font-size: .9rem; }
+form#filters { display: flex; gap: .5rem; margin: 1rem 0; flex-wrap: wrap; }
+input[type=search] { font: inherit; padding: .4rem .6rem; border: 1px solid #ccc; border-radius: 6px; flex: 1; min-width: 200px; }
 table { border-collapse: collapse; width: 100%; }
-th, td { border: 1px solid #ccc; padding: .4rem .6rem; text-align: left; font-size: .9rem; }
-tr.detail td { background: #f6f6f6; white-space: pre-wrap; }
+th, td { border: 1px solid #ccc; padding: .4rem .6rem; text-align: left; font-size: .9rem; vertical-align: top; }
+td.at { white-space: nowrap; }
+td.empty { text-align: center; color: #666; padding: 2rem; }
+tr.detail td { background: rgba(128,128,128,.08); }
+details summary { cursor: pointer; color: #666; font-size: .8rem; }
+.full { white-space: pre-wrap; margin-top: .4rem; }
+.meta { color: #666; font-size: .75rem; margin-top: .4rem; }
+.toolbar { display: flex; justify-content: space-between; align-items: center; margin-top: 1rem; color: #666; font-size: .8rem; }
+button.danger { font: inherit; padding: .4rem .8rem; border-radius: 6px; border: 1px solid #c00; background: none; color: #c00; cursor: pointer; }
 </style>
 </head>
 <body>
+<header>
 <h1>fake-email-server inbox</h1>
-<p><span id="count">0</span> messages · auto-refreshes every 3s · ephemeral (restart wipes)</p>
+<div id="stats" hx-get="/stats" hx-trigger="load, every 3s" hx-swap="innerHTML">…</div>
+</header>
+<form id="filters" hx-get="/rows" hx-target="#rows" hx-swap="innerHTML"
+      hx-trigger="load, every 3s, keyup changed delay:300ms from:#q">
+<input id="q" name="q" type="search" placeholder="Search to / subject / from / body…" autocomplete="off">
+</form>
 <table>
 <thead><tr><th>To</th><th>Subject</th><th>At</th></tr></thead>
 <tbody id="rows"></tbody>
 </table>
-<script>
-async function load() {
-  const res = await fetch('/api/messages');
-  const j = await res.json();
-  document.getElementById('count').textContent = j.total;
-  const tb = document.getElementById('rows');
-  tb.innerHTML = '';
-  for (const m of j.data) {
-    const tr = document.createElement('tr');
-    tr.innerHTML = `<td></td><td></td><td>${m.received_at}</td>`;
-    tr.children[0].textContent = (m.to || []).join(', ');
-    tr.children[1].textContent = m.subject || '(no subject)';
-    tr.style.cursor = 'pointer';
-    tr.onclick = () => {
-      const d = document.createElement('tr');
-      d.className = 'detail';
-      const td = document.createElement('td');
-      td.colSpan = 3;
-      td.textContent = `from: ${m.from}\n\n${m.body}`;
-      d.appendChild(td);
-      tr.after(d);
-    };
-    tb.appendChild(tr);
-  }
-}
-load();
-setInterval(load, 3000);
-</script>
+<div class="toolbar">
+<span>Ephemeral — restarts wipe the inbox. SMTP on :1025.</span>
+<button class="danger" hx-post="/clear" hx-confirm="Delete all messages?" hx-target="#rows" hx-swap="innerHTML">Clear inbox</button>
+</div>
 </body>
-</html>"#;
+</html>"##;
 
 async fn index() -> Html<&'static str> {
     Html(INDEX_HTML)
@@ -261,6 +371,10 @@ async fn index() -> Html<&'static str> {
 fn http_router(state: AppState) -> Router {
     Router::new()
         .route("/api/messages", get(messages))
+        .route("/rows", get(rows))
+        .route("/stats", get(stats))
+        .route("/clear", post(clear))
+        .route("/htmx.min.js", get(htmx_js))
         .route("/healthz", get(healthz))
         .route("/", get(index))
         .with_state(state)
@@ -283,8 +397,7 @@ async fn serve_smtp(listener: TcpListener, state: AppState) {
 async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
     let host = std::env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
@@ -306,12 +419,11 @@ async fn main() {
         .await
         .expect("bind http");
     tracing::info!("fake-email-server smtp on {host}:{smtp_port}, http on {host}:{http_port}");
-    tokio::join!(
-        serve_smtp(smtp, state.clone()),
-        async {
-            axum::serve(http, http_router(state)).await.expect("serve http");
-        }
-    );
+    tokio::join!(serve_smtp(smtp, state.clone()), async {
+        axum::serve(http, http_router(state))
+            .await
+            .expect("serve http");
+    });
 }
 
 #[cfg(test)]
@@ -335,7 +447,9 @@ mod tests {
 
     /// Speak SMTP the way swaks/smtplib do: commands + DATA block.
     async fn send_mail(port: u16, from: &str, to: &[&str], subject: &str, body: &str) {
-        let stream = TcpStream::connect(format!("127.0.0.1:{port}")).await.unwrap();
+        let stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
         let (reader, mut writer) = stream.into_split();
         let mut lines = BufReader::new(reader).lines();
         assert!(lines.next_line().await.unwrap().unwrap().starts_with("220"));
@@ -344,19 +458,34 @@ mod tests {
             lines: &mut tokio::io::Lines<BufReader<tokio::net::tcp::OwnedReadHalf>>,
             s: &str,
         ) -> String {
-            writer.write_all(format!("{s}\r\n").as_bytes()).await.unwrap();
+            writer
+                .write_all(format!("{s}\r\n").as_bytes())
+                .await
+                .unwrap();
             lines.next_line().await.unwrap().unwrap()
         }
-        assert!(cmd(&mut writer, &mut lines, "EHLO test").await.starts_with("250"));
-        assert!(cmd(&mut writer, &mut lines, &format!("MAIL FROM:<{from}>"))
-            .await
-            .starts_with("250"));
-        for rcpt in to {
-            assert!(cmd(&mut writer, &mut lines, &format!("RCPT TO:<{rcpt}>"))
+        assert!(
+            cmd(&mut writer, &mut lines, "EHLO test")
                 .await
-                .starts_with("250"));
+                .starts_with("250")
+        );
+        assert!(
+            cmd(&mut writer, &mut lines, &format!("MAIL FROM:<{from}>"))
+                .await
+                .starts_with("250")
+        );
+        for rcpt in to {
+            assert!(
+                cmd(&mut writer, &mut lines, &format!("RCPT TO:<{rcpt}>"))
+                    .await
+                    .starts_with("250")
+            );
         }
-        assert!(cmd(&mut writer, &mut lines, "DATA").await.starts_with("354"));
+        assert!(
+            cmd(&mut writer, &mut lines, "DATA")
+                .await
+                .starts_with("354")
+        );
         writer
             .write_all(
                 format!("From: {from}\r\nSubject: {subject}\r\n\r\n{body}\r\n.\r\n").as_bytes(),
@@ -364,7 +493,11 @@ mod tests {
             .await
             .unwrap();
         assert!(lines.next_line().await.unwrap().unwrap().starts_with("250"));
-        assert!(cmd(&mut writer, &mut lines, "QUIT").await.starts_with("221"));
+        assert!(
+            cmd(&mut writer, &mut lines, "QUIT")
+                .await
+                .starts_with("221")
+        );
     }
 
     #[tokio::test]
@@ -391,7 +524,9 @@ mod tests {
     async fn rset_clears_envelope_and_unknown_rejected() {
         let st = state();
         let port = smtp_port(st.clone()).await;
-        let stream = TcpStream::connect(format!("127.0.0.1:{port}")).await.unwrap();
+        let stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
         let (reader, mut writer) = stream.into_split();
         let mut lines = BufReader::new(reader).lines();
         assert!(lines.next_line().await.unwrap().unwrap().starts_with("220"));
@@ -400,13 +535,32 @@ mod tests {
             lines: &mut tokio::io::Lines<BufReader<tokio::net::tcp::OwnedReadHalf>>,
             s: &str,
         ) -> String {
-            writer.write_all(format!("{s}\r\n").as_bytes()).await.unwrap();
+            writer
+                .write_all(format!("{s}\r\n").as_bytes())
+                .await
+                .unwrap();
             lines.next_line().await.unwrap().unwrap()
         }
-        assert!(cmd(&mut writer, &mut lines, "MAIL FROM:<a@x>").await.starts_with("250"));
-        assert!(cmd(&mut writer, &mut lines, "RSET").await.starts_with("250"));
-        assert!(cmd(&mut writer, &mut lines, "FROBNICATE").await.starts_with("502"));
-        assert!(cmd(&mut writer, &mut lines, "QUIT").await.starts_with("221"));
+        assert!(
+            cmd(&mut writer, &mut lines, "MAIL FROM:<a@x>")
+                .await
+                .starts_with("250")
+        );
+        assert!(
+            cmd(&mut writer, &mut lines, "RSET")
+                .await
+                .starts_with("250")
+        );
+        assert!(
+            cmd(&mut writer, &mut lines, "FROBNICATE")
+                .await
+                .starts_with("502")
+        );
+        assert!(
+            cmd(&mut writer, &mut lines, "QUIT")
+                .await
+                .starts_with("221")
+        );
         assert!(st.inbox.read().unwrap().is_empty());
     }
 
@@ -426,12 +580,76 @@ mod tests {
     fn inbox_caps_newest_and_addr_trims_brackets() {
         let st = state();
         for i in 0..(MAX_KEPT + 3) {
-            store(&st, format!("{i}@x"), vec![], &format!("Subject: s{i}\n\nb"));
+            store(
+                &st,
+                format!("{i}@x"),
+                vec![],
+                &format!("Subject: s{i}\n\nb"),
+            );
         }
         let inbox = st.inbox.read().unwrap();
         assert_eq!(inbox.len(), MAX_KEPT);
         assert_eq!(inbox.last().unwrap().from, format!("{}@x", MAX_KEPT + 2));
         assert_eq!(addr("RCPT TO:<ops@1km.test>"), "ops@1km.test");
         assert_eq!(addr("MAIL FROM: boss@1km.test"), "boss@1km.test");
+    }
+
+    #[tokio::test]
+    async fn ui_rows_search_clear_and_stats() {
+        use axum_test::TestServer;
+        let server = || {
+            TestServer::new(http_router(AppState {
+                inbox: Arc::new(RwLock::new(Vec::new())),
+            }))
+            .unwrap()
+        };
+        let s = server();
+        let idx = s.get("/").await;
+        idx.assert_status_ok();
+        idx.assert_text_contains("htmx.min.js");
+        s.get("/htmx.min.js").await.assert_status_ok();
+
+        store(
+            &AppState {
+                inbox: Arc::new(RwLock::new(Vec::new())),
+            },
+            "a@x".to_string(),
+            vec![],
+            "Subject: x\n\nb",
+        );
+        // Fresh server is empty → empty state renders.
+        let empty = s.get("/rows").await;
+        empty.assert_text_contains("No mail yet");
+
+        // Seed through the shared state instead: rebuild with content.
+        let st = state();
+        store(
+            &st,
+            "ops@1km.test".to_string(),
+            vec!["boss@1km.test".to_string()],
+            "Subject: Weekly dues\n\nHello",
+        );
+        store(
+            &st,
+            "spam@x".to_string(),
+            vec![],
+            "Subject: x\n\n<b>bold</b>",
+        );
+        let s2 = TestServer::new(http_router(st)).unwrap();
+        let rows = s2.get("/rows").await;
+        rows.assert_text_contains("Weekly dues");
+        let q = s2.get("/rows?q=dues").await;
+        q.assert_text_contains("Weekly dues");
+        let none = s2.get("/rows?q=zzz-no-match").await;
+        none.assert_text_contains("No mail yet");
+        // Bodies are HTML-escaped (XSS-safe).
+        let esc = s2.get("/rows?q=bold").await;
+        let html = esc.text();
+        assert!(html.contains("&lt;b&gt;"));
+        assert!(!html.contains("<b>bold</b>"));
+        let stats = s2.get("/stats").await;
+        stats.assert_text_contains("2</strong> messages");
+        let cleared = s2.post("/clear").await;
+        cleared.assert_text_contains("No mail yet");
     }
 }
