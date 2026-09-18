@@ -269,10 +269,11 @@ fn rows_html(items: &[Email]) -> String {
     let mut out = String::new();
     for m in items {
         out.push_str(&format!(
-            "<tr><td>{}</td><td>{}</td><td class=\"at\">{}</td></tr><tr class=\"detail\"><td colspan=\"3\"><details><summary>from: {}</summary><div class=\"full\">{}</div><div class=\"meta\">id: {}</div></details></td></tr>",
+            "<tr><td class=\"mono\">{}</td><td>{}</td><td class=\"mono at\">{}</td></tr><tr class=\"detail\"><td colspan=\"3\"><details data-sid=\"{}\"><summary>from: {}</summary><div class=\"full\">{}</div><div class=\"meta\">id: {}</div></details></td></tr>",
             esc(&m.to.join(", ")),
             esc(&short_subject(&m.subject)),
             m.received_at.format("%d %b %H:%M:%S"),
+            m.id,
             esc(&m.from),
             esc(&m.body),
             m.id,
@@ -327,41 +328,94 @@ const INDEX_HTML: &str = r##"<!doctype html>
 <script src="/htmx.min.js"></script>
 <style>
 :root { color-scheme: light dark; }
-body { font-family: system-ui, sans-serif; max-width: 860px; margin: 2rem auto; padding: 0 1rem; }
-header { display: flex; align-items: baseline; gap: 1rem; flex-wrap: wrap; }
-header h1 { margin: 0; font-size: 1.4rem; }
-#stats { color: #666; font-size: .9rem; }
-form#filters { display: flex; gap: .5rem; margin: 1rem 0; flex-wrap: wrap; }
-input[type=search] { font: inherit; padding: .4rem .6rem; border: 1px solid #ccc; border-radius: 6px; flex: 1; min-width: 200px; }
+* { box-sizing: border-box; }
+body { font-family: system-ui, -apple-system, sans-serif; font-size: 13px; margin: 0; background: light-dark(#f1f2f4, #141518); color: light-dark(#1c1e21, #e4e5e7); }
+.topbar { background: #23272f; color: #e4e5e7; padding: .45rem 1rem; display: flex; align-items: center; gap: .6rem; }
+.topbar h1 { margin: 0; font-size: .95rem; font-weight: 600; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: #37bf5d; display: inline-block; }
+.topbar #stats { color: #b9bdc4; font-size: .8rem; }
+.topbar #stats strong { color: #fff; }
+main { max-width: 1020px; margin: 0 auto; padding: .8rem 1rem 2rem; }
+.panel { background: light-dark(#fff, #1d1f24); border: 1px solid light-dark(#d7dae0, #33363d); border-radius: 6px; overflow: hidden; }
+.toolbar { display: flex; gap: .5rem; padding: .5rem .6rem; border-bottom: 1px solid light-dark(#d7dae0, #33363d); background: light-dark(#f7f8fa, #22242a); flex-wrap: wrap; align-items: center; }
+input[type=search] { font: inherit; font-size: 12px; padding: .3rem .5rem; border: 1px solid light-dark(#c3c7cf, #44474f); border-radius: 4px; background: light-dark(#fff, #141518); color: inherit; flex: 1; min-width: 180px; }
+button { font: inherit; font-size: 12px; padding: .3rem .7rem; border-radius: 4px; border: 1px solid light-dark(#c3c7cf, #44474f); background: light-dark(#fff, #26282e); color: inherit; cursor: pointer; white-space: nowrap; }
+button:hover { background: light-dark(#eef0f3, #2e3138); }
+button[aria-pressed=true] { border-color: #e0a100; color: light-dark(#8a5f00, #ffd75e); }
+button.danger { border-color: #c0392b; color: #e05244; background: none; }
+button.danger:hover { background: rgba(224,82,68,.1); }
+#sync { font-size: 11px; color: #888; opacity: 0; transition: opacity .2s; }
+#sync.htmx-request { opacity: 1; }
 table { border-collapse: collapse; width: 100%; }
-th, td { border: 1px solid #ccc; padding: .4rem .6rem; text-align: left; font-size: .9rem; vertical-align: top; }
+th { text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: #888; padding: .35rem .6rem; border-bottom: 1px solid light-dark(#d7dae0, #33363d); }
+td { padding: .35rem .6rem; border-bottom: 1px solid light-dark(#e8eaee, #2a2d33); vertical-align: top; }
+tbody tr:last-child td { border-bottom: none; }
+tbody tr:hover td { background: light-dark(#f4f7fb, #23262c); }
+td.mono, .meta { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
 td.at { white-space: nowrap; }
-td.empty { text-align: center; color: #666; padding: 2rem; }
-tr.detail td { background: rgba(128,128,128,.08); }
-details summary { cursor: pointer; color: #666; font-size: .8rem; }
-.full { white-space: pre-wrap; margin-top: .4rem; }
-.meta { color: #666; font-size: .75rem; margin-top: .4rem; }
-.toolbar { display: flex; justify-content: space-between; align-items: center; margin-top: 1rem; color: #666; font-size: .8rem; }
-button.danger { font: inherit; padding: .4rem .8rem; border-radius: 6px; border: 1px solid #c00; background: none; color: #c00; cursor: pointer; }
+td.empty { text-align: center; color: #888; padding: 2.2rem 1rem; }
+tr.detail td { background: light-dark(#f4f6f9, #20232a); }
+details summary { cursor: pointer; color: #888; font-size: 11px; }
+.full { white-space: pre-wrap; margin-top: .35rem; }
+.meta { color: #888; font-size: 11px; margin-top: .35rem; }
+.footer { display: flex; justify-content: space-between; align-items: center; margin-top: .6rem; color: #888; font-size: 11px; flex-wrap: wrap; gap: .5rem; }
+.footer code { font-family: ui-monospace, monospace; }
 </style>
 </head>
 <body>
-<header>
-<h1>fake-email-server inbox</h1>
+<div class="topbar">
+<span class="dot" title="live"></span>
+<h1>fake-email-server</h1>
 <div id="stats" hx-get="/stats" hx-trigger="load, every 3s" hx-swap="innerHTML">…</div>
-</header>
-<form id="filters" hx-get="/rows" hx-target="#rows" hx-swap="innerHTML"
-      hx-trigger="load, every 3s, keyup changed delay:300ms from:#q">
+</div>
+<main>
+<div class="panel">
+<div class="toolbar">
+<form id="filters" hx-get="/rows" hx-target="#rows" hx-swap="innerHTML" hx-indicator="#sync"
+      hx-trigger="load, every 3s, keyup changed delay:300ms from:#q"
+      style="display:contents">
 <input id="q" name="q" type="search" placeholder="Search to / subject / from / body…" autocomplete="off">
 </form>
+<span id="sync">sync…</span>
+<button id="livebtn" type="button" aria-pressed="false" onclick="toggleLive(this)">Pause live</button>
+<button type="button" class="danger" hx-post="/clear" hx-confirm="Delete all messages?" hx-target="#rows" hx-swap="innerHTML">Clear</button>
+</div>
 <table>
 <thead><tr><th>To</th><th>Subject</th><th>At</th></tr></thead>
 <tbody id="rows"></tbody>
 </table>
-<div class="toolbar">
-<span>Ephemeral — restarts wipe the inbox. SMTP on :1025.</span>
-<button class="danger" hx-post="/clear" hx-confirm="Delete all messages?" hx-target="#rows" hx-swap="innerHTML">Clear inbox</button>
 </div>
+<div class="footer">
+<span>Ephemeral — restarts wipe the inbox.</span>
+<span>SMTP on <code>:1025</code> · no auth, no TLS.</span>
+</div>
+</main>
+<script>
+// Preserve expanded rows across polls: the 3s refresh re-renders the
+// tbody, which would otherwise snap every open disclosure shut.
+const openRows = new Set();
+document.body.addEventListener('toggle', (e) => {
+  const d = e.target.closest ? e.target.closest('details[data-sid]') : null;
+  if (!d) return;
+  if (d.open) openRows.add(d.dataset.sid); else openRows.delete(d.dataset.sid);
+}, true);
+document.body.addEventListener('htmx:afterSwap', (e) => {
+  if (e.target.id !== 'rows') return;
+  e.target.querySelectorAll('details[data-sid]').forEach((d) => {
+    if (openRows.has(d.dataset.sid)) d.open = true;
+  });
+});
+// Pause/resume the poller by swapping its trigger (htmx.process re-binds).
+function toggleLive(btn) {
+  const form = document.getElementById('filters');
+  if (!form.dataset.poll) form.dataset.poll = form.getAttribute('hx-trigger');
+  const paused = btn.getAttribute('aria-pressed') === 'true' ? false : true;
+  btn.setAttribute('aria-pressed', paused ? 'true' : 'false');
+  btn.textContent = paused ? 'Resume live' : 'Pause live';
+  form.setAttribute('hx-trigger', paused ? 'none' : form.dataset.poll);
+  htmx.process(form);
+}
+</script>
 </body>
 </html>"##;
 
