@@ -399,9 +399,10 @@ document.body.addEventListener('toggle', (e) => {
   if (!d) return;
   if (d.open) openRows.add(d.dataset.sid); else openRows.delete(d.dataset.sid);
 }, true);
-document.body.addEventListener('htmx:after:swap', (e) => {
-  if (e.target.id !== 'rows') return;
-  e.target.querySelectorAll('details[data-sid]').forEach((d) => {
+document.body.addEventListener('htmx:after:swap', () => {
+  // v4 dispatches on the requesting element (the form), not the swap
+  // target — so re-apply across the document, scoped to #rows.
+  document.querySelectorAll('#rows details[data-sid]').forEach((d) => {
     if (openRows.has(d.dataset.sid)) d.open = true;
   });
 });
