@@ -3,6 +3,7 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock* ./
 RUN mkdir src && echo 'fn main() {}' > src/main.rs && cargo build --release; rm -rf src
 COPY src ./src
+COPY htmx.min.js ./htmx.min.js
 # COPY can preserve source mtimes older than the cached dummy-build
 # artifacts, in which case cargo sees a fresh fingerprint, skips the
 # rebuild, and we'd ship the dummy binary. Touch forces the real build.
