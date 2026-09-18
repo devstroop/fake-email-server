@@ -283,7 +283,8 @@ fn rows_html(items: &[Email]) -> String {
 
 fn stats_html(state: &AppState) -> String {
     let n = state.inbox.read().map(|g| g.len()).unwrap_or(0);
-    format!("<strong>{n}</strong> messages")
+    let plural = if n == 1 { "message" } else { "messages" };
+    format!("<strong>{n}</strong> {plural}")
 }
 
 async fn rows(
