@@ -399,7 +399,7 @@ document.body.addEventListener('toggle', (e) => {
   if (!d) return;
   if (d.open) openRows.add(d.dataset.sid); else openRows.delete(d.dataset.sid);
 }, true);
-document.body.addEventListener('htmx:afterSwap', (e) => {
+document.body.addEventListener('htmx:after:swap', (e) => {
   if (e.target.id !== 'rows') return;
   e.target.querySelectorAll('details[data-sid]').forEach((d) => {
     if (openRows.has(d.dataset.sid)) d.open = true;
